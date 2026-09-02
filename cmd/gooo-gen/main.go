@@ -103,7 +103,7 @@ func parse(source string) (policy, error) {
 			}
 			p.ImprovementRule = fields[1]
 		case "cell":
-			if len(fields) < 8 {
+			if len(fields) < 6 {
 				return p, fmt.Errorf("line %d: cell needs id, topic, layer, lens, check and arguments", lineNumber+1)
 			}
 			p.Cells = append(p.Cells, cell{
