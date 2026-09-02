@@ -1,0 +1,256 @@
+// Command gooo-gen compiles the small Gooo metacode form into deterministic Go data.
+// It contains no evaluator policy: policy facts and check operations come from .gooo.
+package main
+
+import (
+	"bytes"
+	"flag"
+	"fmt"
+	"go/format"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+type cell struct {
+	ID    string
+	Topic string
+	Layer string
+	Lens  string
+	Check string
+	Args  []string
+}
+
+type fixture struct {
+	Name               string
+	Kind               string
+	ExpectedDecision   string
+	ExpectedImprovement string
+	Facts              map[string]string
+}
+
+type policy struct {
+	Name              string
+	Version           string
+	Denominator       int
+	Precedence        []string
+	UnknownFields     []string
+	ImprovementRule   string
+	Cells             []cell
+	Fixtures          []fixture
+}
+
+func main() {
+	input := flag.String("input", "gooo/evaluator-integrity.gooo", "Gooo metacode input")
+	output := flag.String("output", "internal/generated", "generated package directory")
+	flag.Parse()
+
+	source, err := os.ReadFile(*input)
+	if err != nil {
+		fail(err)
+	}
+	p, err := parse(string(source))
+	if err != nil {
+		fail(err)
+	}
+	if err := os.MkdirAll(*output, 0o755); err != nil {
+		fail(err)
+	}
+	write(filepath.Join(*output, "policy.go"), renderPolicy(p))
+	write(filepath.Join(*output, "fixtures.go"), renderFixtures(p))
+}
+
+func fail(err error) {
+	fmt.Fprintln(os.Stderr, "gooo-gen:", err)
+	os.Exit(1)
+}
+
+func parse(source string) (policy, error) {
+	var p policy
+	fixtureIndices := map[string]int{}
+	for lineNumber, raw := range strings.Split(source, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		switch fields[0] {
+		case "policy":
+			if len(fields) != 4 {
+				return p, fmt.Errorf("line %d: policy needs name, version, denominator", lineNumber+1)
+			}
+			var err error
+			p.Name, p.Version = fields[1], fields[2]
+			p.Denominator, err = strconv.Atoi(fields[3])
+			if err != nil {
+				return p, fmt.Errorf("line %d: invalid denominator: %w", lineNumber+1, err)
+			}
+		case "precedence":
+			if len(fields) != 2 {
+				return p, fmt.Errorf("line %d: precedence needs one chain", lineNumber+1)
+			}
+			p.Precedence = strings.Split(fields[1], ">")
+		case "unknown_fields":
+			if len(fields) != 2 {
+				return p, fmt.Errorf("line %d: unknown_fields needs one schema", lineNumber+1)
+			}
+			p.UnknownFields = strings.Split(fields[1], "|")
+		case "improvement_rule":
+			if len(fields) != 2 {
+				return p, fmt.Errorf("line %d: improvement_rule needs one rule", lineNumber+1)
+			}
+			p.ImprovementRule = fields[1]
+		case "cell":
+			if len(fields) < 8 {
+				return p, fmt.Errorf("line %d: cell needs id, topic, layer, lens, check and arguments", lineNumber+1)
+			}
+			p.Cells = append(p.Cells, cell{
+				ID: fields[1], Topic: fields[2], Layer: fields[3], Lens: fields[4], Check: fields[5], Args: append([]string(nil), fields[6:]...),
+			})
+		case "fixture":
+			if len(fields) != 5 {
+				return p, fmt.Errorf("line %d: fixture needs name, kind, expected decision and improvement", lineNumber+1)
+			}
+			p.Fixtures = append(p.Fixtures, fixture{Name: fields[1], Kind: fields[2], ExpectedDecision: fields[3], ExpectedImprovement: fields[4], Facts: map[string]string{}})
+			fixtureIndices[fields[1]] = len(p.Fixtures) - 1
+		case "fact":
+			if len(fields) != 4 {
+				return p, fmt.Errorf("line %d: fact needs fixture, key and value", lineNumber+1)
+			}
+			index, ok := fixtureIndices[fields[1]]
+			if !ok {
+				return p, fmt.Errorf("line %d: fact references unknown fixture %q", lineNumber+1, fields[1])
+			}
+			p.Fixtures[index].Facts[fields[2]] = fields[3]
+		default:
+			return p, fmt.Errorf("line %d: unknown directive %q", lineNumber+1, fields[0])
+		}
+	}
+	if p.Name == "" || p.Denominator <= 0 {
+		return p, fmt.Errorf("policy is incomplete")
+	}
+	if len(p.Cells) != p.Denominator {
+		return p, fmt.Errorf("denominator is %d but metacode declares %d cells", p.Denominator, len(p.Cells))
+	}
+	if len(p.UnknownFields) != 6 {
+		return p, fmt.Errorf("UNKNOWN schema must have exactly six fields")
+	}
+	for _, dimension := range []string{"FOUNDATION", "COHERENCE", "REGRESSION"} {
+		if countCells(p.Cells, dimension, true) != 4 {
+			return p, fmt.Errorf("layer %s must have exactly four cells", dimension)
+		}
+	}
+	for _, dimension := range []string{"DRIVER", "OUTCOME", "GUARDRAIL"} {
+		if countCells(p.Cells, dimension, false) != 4 {
+			return p, fmt.Errorf("lens %s must have exactly four cells", dimension)
+		}
+	}
+	return p, nil
+}
+
+func countCells(cells []cell, value string, layer bool) int {
+	count := 0
+	for _, c := range cells {
+		if layer && c.Layer == value || !layer && c.Lens == value {
+			count++
+		}
+	}
+	return count
+}
+
+func renderPolicy(p policy) []byte {
+	var b bytes.Buffer
+	fmt.Fprintln(&b, "// Code generated by gooo-gen from gooo/evaluator-integrity.gooo; DO NOT EDIT.")
+	fmt.Fprintln(&b, "package generated")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "type CellSpec struct {")
+	fmt.Fprintln(&b, "\tID string")
+	fmt.Fprintln(&b, "\tTopic string")
+	fmt.Fprintln(&b, "\tLayer string")
+	fmt.Fprintln(&b, "\tLens string")
+	fmt.Fprintln(&b, "\tCheck string")
+	fmt.Fprintln(&b, "\tArgs []string")
+	fmt.Fprintln(&b, "}")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "type Policy struct {")
+	fmt.Fprintln(&b, "\tName string")
+	fmt.Fprintln(&b, "\tVersion string")
+	fmt.Fprintln(&b, "\tDenominator int")
+	fmt.Fprintln(&b, "\tPrecedence []string")
+	fmt.Fprintln(&b, "\tUnknownFields []string")
+	fmt.Fprintln(&b, "\tImprovementRule string")
+	fmt.Fprintln(&b, "\tGeneratedArtifacts []string")
+	fmt.Fprintln(&b, "\tCells []CellSpec")
+	fmt.Fprintln(&b, "}")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "var PolicyDefinition = Policy{")
+	fmt.Fprintf(&b, "\tName: %s, Version: %s, Denominator: %d, ImprovementRule: %s,\n", quote(p.Name), quote(p.Version), p.Denominator, quote(p.ImprovementRule))
+	fmt.Fprintf(&b, "\tPrecedence: []string{%s},\n", quotedList(p.Precedence))
+	fmt.Fprintf(&b, "\tUnknownFields: []string{%s},\n", quotedList(p.UnknownFields))
+	fmt.Fprintln(&b, "\tGeneratedArtifacts: []string{\"internal/generated/policy.go\", \"internal/generated/fixtures.go\"},")
+	fmt.Fprintln(&b, "\tCells: []CellSpec{")
+	for _, c := range p.Cells {
+		fmt.Fprintf(&b, "\t\t{ID: %s, Topic: %s, Layer: %s, Lens: %s, Check: %s, Args: []string{%s}},\n", quote(c.ID), quote(c.Topic), quote(c.Layer), quote(c.Lens), quote(c.Check), quotedList(c.Args))
+	}
+	fmt.Fprintln(&b, "\t},")
+	fmt.Fprintln(&b, "}")
+	return gofmt(b.Bytes())
+}
+
+func renderFixtures(p policy) []byte {
+	var b bytes.Buffer
+	fmt.Fprintln(&b, "// Code generated by gooo-gen from gooo/evaluator-integrity.gooo; DO NOT EDIT.")
+	fmt.Fprintln(&b, "package generated")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "type Fixture struct {")
+	fmt.Fprintln(&b, "\tName string")
+	fmt.Fprintln(&b, "\tKind string")
+	fmt.Fprintln(&b, "\tExpectedDecision string")
+	fmt.Fprintln(&b, "\tExpectedImprovement string")
+	fmt.Fprintln(&b, "\tFacts map[string]string")
+	fmt.Fprintln(&b, "}")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "var Fixtures = []Fixture{")
+	for _, f := range p.Fixtures {
+		fmt.Fprintf(&b, "\t{Name: %s, Kind: %s, ExpectedDecision: %s, ExpectedImprovement: %s, Facts: map[string]string{\n", quote(f.Name), quote(f.Kind), quote(f.ExpectedDecision), quote(f.ExpectedImprovement))
+		keys := make([]string, 0, len(f.Facts))
+		for key := range f.Facts {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			fmt.Fprintf(&b, "\t\t%s: %s,\n", quote(key), quote(f.Facts[key]))
+		}
+		fmt.Fprintln(&b, "\t}},")
+	}
+	fmt.Fprintln(&b, "}")
+	return gofmt(b.Bytes())
+}
+
+func quotedList(values []string) string {
+	quoted := make([]string, len(values))
+	for i, value := range values {
+		quoted[i] = quote(value)
+	}
+	return strings.Join(quoted, ", ")
+}
+
+func quote(value string) string {
+	return strconv.Quote(value)
+}
+
+func gofmt(source []byte) []byte {
+	formatted, err := format.Source(source)
+	if err != nil {
+		fail(fmt.Errorf("format generated source: %w", err))
+	}
+	return formatted
+}
+
+func write(path string, source []byte) {
+	if err := os.WriteFile(path, source, 0o644); err != nil {
+		fail(err)
+	}
+}

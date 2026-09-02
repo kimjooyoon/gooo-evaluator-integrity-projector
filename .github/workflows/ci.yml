@@ -1,0 +1,79 @@
+name: Gooo evaluator integrity
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate generated evaluator and replay
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source with github.token
+        uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+
+      - name: Set up Go 1.27.x
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+
+      - name: go generate
+        run: go generate ./...
+
+      - name: go fix
+        run: go fix ./...
+
+      - name: go format
+        run: go fmt ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: Conformance
+        run: |
+          mkdir -p out
+          go run ./cmd/gooo conformance > out/conformance.json
+
+      - name: Replay
+        run: go run ./cmd/gooo replay > out/replay.json
+
+      - name: Provenance
+        run: go run ./cmd/gooo provenance > out/provenance.json
+
+      - name: Record GitHub run provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --jq '{id:.id,run_number:.run_number,head_sha:.head_sha,event:.event,status:.status,conclusion:.conclusion}' \
+            > out/github-run.json
+
+      - name: Write output digests
+        if: always()
+        run: |
+          if [ -d out ]; then
+            sha256sum out/* > out/SHA256SUMS
+          fi
+
+      - name: Upload validation bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-bundle-${{ github.run_id }}
+          path: out
+          if-no-files-found: warn
+          retention-days: 90
